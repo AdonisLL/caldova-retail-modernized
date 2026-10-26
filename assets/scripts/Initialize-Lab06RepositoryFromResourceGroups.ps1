@@ -1,7 +1,5 @@
 [CmdletBinding(DefaultParameterSetName = 'Protected')]
 param(
-    [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
     [string]$SubscriptionId,
 
     [string]$Repository,
@@ -512,6 +510,14 @@ function Set-AndVerifyVariables {
     }
 }
 
+# A nonblank subscription wins; otherwise use the current Azure CLI account.
+if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
+    $SubscriptionId = az account show --query id --output tsv --only-show-errors
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($SubscriptionId)) {
+        throw 'Failed to resolve the active Azure subscription. Sign in with az login or supply -SubscriptionId.'
+    }
+}
+
 az account set --subscription $SubscriptionId
 $account = az account show --output json | ConvertFrom-Json
 if ($account.id -ne $SubscriptionId) {
@@ -712,6 +718,38 @@ Assert-RoleAssignment `
     -PrincipalId $values.LAB06_DEPLOY_AZURE_PRINCIPAL_ID `
     -Role Reader `
     -Scope $values.FRONT_DOOR_PROFILE_ID
+
+$buildPrincipalId = [string]$values.LAB06_BUILD_AZURE_PRINCIPAL_ID
+if ([string]::IsNullOrWhiteSpace($buildPrincipalId)) {
+    throw 'The build identity principal ID is missing.'
+}
+
+# AcrPush covers image data; Reader allows the workflow to inspect registry metadata.
+$readerAssignments = az role assignment list `
+    --subscription $SubscriptionId `
+    --assignee-object-id $buildPrincipalId `
+    --scope $registryId `
+    --include-inherited `
+    --role Reader `
+    --output json `
+    --only-show-errors
+if ($LASTEXITCODE -ne 0) {
+    throw 'Failed to inspect the build identity registry Reader assignments.'
+}
+
+if (@($readerAssignments | ConvertFrom-Json -ErrorAction Stop).Count -eq 0) {
+    az role assignment create `
+        --subscription $SubscriptionId `
+        --assignee-object-id $buildPrincipalId `
+        --assignee-principal-type ServicePrincipal `
+        --role Reader `
+        --scope $registryId `
+        --output none `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to grant the build identity Reader on the container registry.'
+    }
+}
 
 try {
     gh api `

@@ -140,11 +140,21 @@ publishes non-secret variables from the instructor deployment.
 
 | Environment | Identity | Required access |
 | --- | --- | --- |
-| `lab06` | Dedicated build identity | `AcrPush` on the existing ACR |
+| `lab06` | Dedicated build identity | `AcrPush` and registry metadata `Reader` on the existing ACR |
 | `lab06-deploy` | Dedicated deployment identity | `Container Apps Contributor` on the retail app and `Reader` on the Front Door profile |
 
 Both jobs authenticate with GitHub OIDC. Do not use Azure client secrets, ACR
 admin credentials, SQL passwords, or long-lived tokens.
+
+The [repository initializer](../scripts/Initialize-Lab06RepositoryFromResourceGroups.ps1)
+uses the active Azure CLI subscription when `-SubscriptionId` is omitted, null,
+empty, or whitespace; an explicit nonblank value overrides that selection.
+Sign in with `az login` first and check
+the active subscription with `az account show`. After verifying the existing
+Lab 04 role assignments, the initializer grants the build identity `Reader`
+on the registry only if no direct or inherited Reader assignment exists.
+The operator needs permission to create role assignments at that scope when
+the grant is missing; the initializer does not grant itself that permission.
 
 ### Variables
 

@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -67,7 +68,18 @@ var app = builder.Build();
 
 app.LogAzureIntegrations(builder);
 
-if (!app.Environment.IsDevelopment())
+var showDetailedErrors = app.Environment.IsDevelopment() ||
+    app.Configuration.GetValue<bool>(WebHostDefaults.DetailedErrorsKey);
+if (showDetailedErrors)
+{
+    app.UseDeveloperExceptionPage();
+    if (!app.Environment.IsDevelopment())
+    {
+        app.Logger.LogWarning(
+            "ASPNETCORE_DETAILEDERRORS is enabled outside Development. Exception details may expose sensitive information. Disable it after troubleshooting.");
+    }
+}
+else
 {
     app.UseExceptionHandler("/Error", createScopeForErrors: true);
 }
@@ -90,6 +102,8 @@ if (disableAntiforgeryForLab)
 
 app.MapHealthChecks("/health", new HealthCheckOptions { Predicate = _ => false });
 app.MapHealthChecks("/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
+// The existing Front Door origin probe uses HEAD /, which Razor component routes do not handle.
+app.MapMethods("/", new[] { HttpMethods.Head }, () => Results.Ok());
 
 // Signing out has no page of its own; the header's "Log out" button posts here. The endpoint binds
 // no form fields, so the antiforgery token is checked explicitly outside deployment-only lab mode.

@@ -4,20 +4,46 @@ on:
   pull_request:
     paths:
       - src/**
+      - tests/**
+      - .dockerignore
       - eShopLiteFx.sln
+      - global.json
+      - NuGet.Config
+      - nuget.config
+      - Directory.Build.*
+      - Directory.Packages.props
       - .github/workflows/lab06-retail-cicd.yml
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - src/**
+      - tests/**
+      - .dockerignore
       - eShopLiteFx.sln
+      - global.json
+      - NuGet.Config
+      - nuget.config
+      - Directory.Build.*
+      - Directory.Packages.props
       - .github/workflows/lab06-retail-cicd.yml
   workflow_dispatch:
-
-concurrency:
-  group: lab06-retail-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      successful_run_id:
+        description: Successful main release run whose recorded digest should be restored
+        required: true
+        type: string
+      expected_current_image:
+        description: Exact image reference currently deployed (optimistic concurrency guard)
+        required: true
+        type: string
+      expected_current_revision:
+        description: Exact latest revision currently deployed
+        required: true
+        type: string
+      reason:
+        description: Reason for the approved rollback
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,219 +53,521 @@ env:
   BUILD_CONTEXT: .
   DOCKERFILE: src/eShopLite.StoreFx/Dockerfile
   IMAGE_REPOSITORY: caldova-retail
+  AZURE_CORE_ONLY_SHOW_ERRORS: "true"
+  AZURE_CORE_COLLECT_TELEMETRY: "false"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   validate:
-    name: Build and smoke test
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: retail-validation-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
-
       - name: Restore
         run: dotnet restore "$SOLUTION"
-
       - name: Build
         run: dotnet build "$SOLUTION" --configuration Release --no-restore
-
-      - name: Test
-        run: dotnet test "$SOLUTION" --configuration Release --no-build
-
-      - name: Build container
-        run: docker build --file "$DOCKERFILE" --tag caldova-retail:validation "$BUILD_CONTEXT"
-
-      - name: Smoke test container
-        shell: bash
+      - name: Test and report discovered coverage
         run: |
           set -euo pipefail
-          container_name="caldova-retail-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          cleanup() {
-            docker rm --force "$container_name" >/dev/null 2>&1 || true
-          }
+          dotnet test "$SOLUTION" --configuration Release --no-build \
+            --logger trx --results-directory "$RUNNER_TEMP/retail-tests"
+          python3 - <<'PY'
+          import glob, os, xml.etree.ElementTree as ET
+          totals = {"total": 0, "passed": 0, "failed": 0, "notExecuted": 0}
+          reports = glob.glob(os.path.join(os.environ["RUNNER_TEMP"], "retail-tests", "**", "*.trx"), recursive=True)
+          for report in reports:
+              root = ET.parse(report).getroot()
+              for counter in root.findall(".//{*}Counters"):
+                  for key in totals:
+                      totals[key] += int(counter.get(key, "0"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"### Tests\n{totals}\n\n")
+              if totals["total"] == 0:
+                  summary.write("**No tests discovered.** This is not evidence of unit/integration coverage.\n\n")
+          if totals["failed"]:
+              raise SystemExit("Test results contain failures.")
+          PY
+      - name: Build container once
+        run: docker build --file "$DOCKERFILE" --tag caldova-retail:validation "$BUILD_CONTEXT"
+      - name: Verify image and local health
+        run: |
+          set -euo pipefail
+          user=$(docker image inspect caldova-retail:validation --format '{{.Config.User}}')
+          [[ -n "$user" && "$user" != root && "$user" != 0 && "$user" != 0:* && "$user" != root:* ]]
+          docker run --rm --entrypoint sh caldova-retail:validation -c 'test "$(id -u)" -ne 0'
+          docker image inspect caldova-retail:validation \
+            --format '{{json .Config.ExposedPorts}}' | jq -e 'has("8080/tcp")' >/dev/null
+          name="retail-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker rm --force "$name" >/dev/null; }
           trap cleanup EXIT
-          docker run --detach \
-            --name "$container_name" \
-            --publish 8080:8080 \
-            --env 'ConnectionStrings__StoreDbContext=Server=localhost;Initial Catalog=eShop;User ID=test;Password=not-used;Encrypt=True;TrustServerCertificate=True' \
-            caldova-retail:validation
+          docker run --detach --name "$name" --publish 127.0.0.1:8080:8080 \
+            --env 'ConnectionStrings__StoreDbContext=Server=localhost;Initial Catalog=retail_smoke;Integrated Security=True;Connect Timeout=1' \
+            caldova-retail:validation >/dev/null
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error http://127.0.0.1:8080/health; then
+            status=$(curl --silent --show-error --connect-timeout 2 --max-time 5 \
+              --output "$RUNNER_TEMP/retail-health" --write-out '%{http_code}' \
+              http://127.0.0.1:8080/health) || status=000
+            if [[ "$status" == 200 && "$(cat "$RUNNER_TEMP/retail-health")" == Healthy ]]; then
+              echo "Local /health: HTTP 200 Healthy on port 8080." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
+            [[ "$(docker inspect "$name" --format '{{.State.Running}}')" == true ]] || break
             sleep 2
           done
-          docker logs "$container_name"
+          # This container has only synthetic configuration; never dump Azure app logs or settings.
+          docker logs --tail 80 "$name"
+          echo "::error::Local container health check failed."
           exit 1
-  build-and-push:
-    name: Push immutable image
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - name: Export validated image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p "$RUNNER_TEMP/retail-image"
+          docker save --output "$RUNNER_TEMP/retail-image/image.tar" caldova-retail:validation
+          docker image inspect caldova-retail:validation --format '{{.Id}}' \
+            > "$RUNNER_TEMP/retail-image/config-id"
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: retail-validated-image
+          path: ${{ runner.temp }}/retail-image/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: lab06
     permissions:
       contents: read
       id-token: write
+    concurrency:
+      group: retail-publish-${{ github.repository }}-${{ github.sha }}
+      cancel-in-progress: false
     outputs:
       image: ${{ steps.image.outputs.reference }}
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Sign in to Azure with OIDC
-        uses: azure/login@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: retail-validated-image
+          path: ${{ runner.temp }}/retail-image
+      - name: Sign in with environment-scoped OIDC
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Build and push
+      - name: Push SHA tag and resolve verified digest
         id: image
-        shell: bash
         env:
           ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
+          ACR_RESOURCE_GROUP: ${{ vars.LAB04_PRIMARY_RESOURCE_GROUP }}
         run: |
           set -euo pipefail
-          login_server="${ACR_NAME}.azurecr.io"
+          : "${ACR_NAME:?Missing registry variable}" "${ACR_RESOURCE_GROUP:?Missing registry scope}"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          server=$(az acr show --name "$ACR_NAME" --resource-group "$ACR_RESOURCE_GROUP" \
+            --query loginServer --output tsv)
+          [[ "$server" == "${ACR_NAME}.azurecr.io" ]]
+          az acr login --name "$ACR_NAME" >/dev/null
+          docker load --input "$RUNNER_TEMP/retail-image/image.tar" >/dev/null
+          expected_id=$(cat "$RUNNER_TEMP/retail-image/config-id")
+          [[ "$(docker image inspect caldova-retail:validation --format '{{.Id}}')" == "$expected_id" ]]
           tag="sha-${GITHUB_SHA}"
-          tagged_image="${login_server}/${IMAGE_REPOSITORY}:${tag}"
-          az acr login --name "$ACR_NAME"
-          docker build --file "$DOCKERFILE" --tag "$tagged_image" "$BUILD_CONTEXT"
-          docker push "$tagged_image"
-          digest=$(az acr repository show \
-            --name "$ACR_NAME" \
-            --image "${IMAGE_REPOSITORY}:${tag}" \
-            --query digest \
-            --output tsv)
-          test -n "$digest"
-          echo "reference=${login_server}/${IMAGE_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+          tagged="${server}/${IMAGE_REPOSITORY}:${tag}"
+          repositories=$(az acr repository list --name "$ACR_NAME" --output json)
+          exists=false
+          if jq -e --arg repo "$IMAGE_REPOSITORY" 'index($repo) != null' <<< "$repositories" >/dev/null; then
+            tags=$(az acr repository show-tags --name "$ACR_NAME" --repository "$IMAGE_REPOSITORY" --output json)
+            if jq -e --arg tag "$tag" 'index($tag) != null' <<< "$tags" >/dev/null; then
+              exists=true
+            fi
+          fi
+          if [[ "$exists" == true ]]; then
+            docker pull "$tagged" >/dev/null
+            if [[ "$(docker image inspect "$tagged" --format '{{.Id}}')" != "$expected_id" ]]; then
+              echo "::error::SHA tag already identifies a different image; refusing to overwrite."
+              exit 1
+            fi
+          else
+            docker tag caldova-retail:validation "$tagged"
+            docker push "$tagged"
+          fi
+          digest=$(az acr repository show --name "$ACR_NAME" \
+            --image "${IMAGE_REPOSITORY}:${tag}" --query digest --output tsv)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="${server}/${IMAGE_REPOSITORY}@${digest}"
+          docker pull "$reference" >/dev/null
+          [[ "$(docker image inspect "$reference" --format '{{.Id}}')" == "$expected_id" ]]
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+          printf '### Published image\nCommit: `%s`\n\nImage: `%s`\n' "$GITHUB_SHA" "$reference" >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
-    name: Deploy approved revision
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     environment: lab06-deploy
     permissions:
       contents: read
       id-token: write
-    steps:
-      - name: Sign in to Azure with OIDC
-        uses: azure/login@v2
+    concurrency:
+      group: retail-mutation-${{ github.repository }}-${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}-${{ vars.LAB06_CONTAINER_APP_NAME }}
+      cancel-in-progress: false
+    env:
+      IMAGE_REFERENCE: ${{ needs.publish.outputs.image }}
+      ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
+      APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
+      APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
+      RUNTIME_IDENTITY_RESOURCE_ID: ${{ vars.LAB06_RUNTIME_IDENTITY_RESOURCE_ID }}
+      RUNTIME_IDENTITY_CLIENT_ID: ${{ vars.LAB06_RUNTIME_IDENTITY_CLIENT_ID }}
+      GLOBAL_RESOURCE_GROUP: ${{ vars.LAB04_GLOBAL_RESOURCE_GROUP }}
+      FRONT_DOOR_PROFILE: ${{ format('{0}-{1}-afd', vars.LAB04_PREFIX, vars.LAB04_SUFFIX) }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps: &release-steps
+      - name: Sign in with deployment environment OIDC
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Verify deployment targets
-        shell: bash
-        env:
-          ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
-          APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
-          APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
-          RUNTIME_IDENTITY_RESOURCE_ID: ${{ vars.LAB06_RUNTIME_IDENTITY_RESOURCE_ID }}
-          IMAGE_REFERENCE: ${{ needs.build-and-push.outputs.image }}
+      - name: Verify target, runtime identity, settings and Front Door
+        id: preflight
         run: |
           set -euo pipefail
-          if [[ "$IMAGE_REFERENCE" != "${ACR_NAME}.azurecr.io/${IMAGE_REPOSITORY}@sha256:"* ]]; then
-            echo "Image reference '$IMAGE_REFERENCE' is not an immutable digest in the expected registry." >&2
-            exit 1
-          fi
-          identity_json=$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$APP_RESOURCE_GROUP" \
-            --query identity.userAssignedIdentities \
-            --output json)
-          if ! jq -e --arg id "${RUNTIME_IDENTITY_RESOURCE_ID,,}" \
-            'keys | map(ascii_downcase) | index($id) != null' \
-            <<< "$identity_json" > /dev/null; then
-            echo "Runtime identity '$RUNTIME_IDENTITY_RESOURCE_ID' is not attached to Container App '$APP_NAME'." >&2
-            exit 1
-          fi
-          registry_identity=$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$APP_RESOURCE_GROUP" \
-            --query "properties.configuration.registries[?server=='${ACR_NAME}.azurecr.io'].identity | [0]" \
-            --output tsv)
-          if [[ "${registry_identity,,}" != "${RUNTIME_IDENTITY_RESOURCE_ID,,}" ]]; then
-            echo "Registry '$ACR_NAME' is not configured to use the expected runtime identity." >&2
-            exit 1
-          fi
-          env_names=$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$APP_RESOURCE_GROUP" \
-            --query 'properties.template.containers[0].env[].name' \
-            --output json)
-          for required_name in \
-            ASPNETCORE_ENVIRONMENT \
-            AZURE_CLIENT_ID \
-            ConnectionStrings__StoreDbContext; do
-            if ! jq -e --arg name "$required_name" 'index($name) != null' \
-              <<< "$env_names" > /dev/null; then
-              echo "Container App '$APP_NAME' is missing required environment variable '$required_name'." >&2
+          umask 077
+          : "${APP_NAME:?}" "${APP_RESOURCE_GROUP:?}" "${ACR_NAME:?}"
+          : "${RUNTIME_IDENTITY_RESOURCE_ID:?}" "${RUNTIME_IDENTITY_CLIENT_ID:?}"
+          : "${GLOBAL_RESOURCE_GROUP:?}" "${FRONT_DOOR_PROFILE:?}"
+          prefix="${ACR_NAME}.azurecr.io/${IMAGE_REPOSITORY}@"
+          [[ "$IMAGE_REFERENCE" == "$prefix"* ]]
+          digest="${IMAGE_REFERENCE#"$prefix"}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          state="$RUNNER_TEMP/retail-release"
+          mkdir -p "$state"
+          az containerapp show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+            --output json > "$state/before.json"
+          # Stop rather than guessing when the platform's single-container contract changes.
+          jq -e --arg identity "${RUNTIME_IDENTITY_RESOURCE_ID,,}" \
+            --arg client "$RUNTIME_IDENTITY_CLIENT_ID" --arg server "${ACR_NAME}.azurecr.io" '
+            . as $app |
+            (.properties.template.containers | length == 1) and
+            (.properties.configuration.activeRevisionsMode == "Single") and
+            (.properties.configuration.ingress.targetPort == 8080) and
+            ([.identity.userAssignedIdentities | to_entries[] |
+              select((.key | ascii_downcase) == $identity) |
+              select((.value.clientId | ascii_downcase) == ($client | ascii_downcase))] | length == 1) and
+            ([.properties.configuration.registries[] | select(.server == $server)] |
+              length == 1 and (.[0].identity | ascii_downcase) == $identity and
+              (.[0].username // "") == "" and (.[0].passwordSecretRef // "") == "") and
+            (.properties.template.containers[0].env as $env |
+              all(["ASPNETCORE_ENVIRONMENT", "AZURE_CLIENT_ID", "ConnectionStrings__StoreDbContext"][];
+                . as $name | [$env[] | select(.name == $name)] | length == 1) and
+              any($env[]; .name == "ASPNETCORE_ENVIRONMENT" and .value == "Production") and
+              any($env[]; .name == "AZURE_CLIENT_ID" and
+                ((.value // "" | ascii_downcase) == ($client | ascii_downcase))) and
+              any($env[]; .name == "ConnectionStrings__StoreDbContext" and
+                (((.value // "") | length) > 0 or
+                 (.secretRef as $ref | ($ref // "" | length) > 0 and
+                  any($app.properties.configuration.secrets[]?; .name == $ref)))))
+            ' "$state/before.json" >/dev/null || {
+              echo "::error::Platform prerequisites differ or SQL configuration is missing. Instructor repair required; no settings will be changed."
               exit 1
+            }
+          jq -S '{
+            identity, location, tags,
+            environmentId: .properties.environmentId,
+            workloadProfileName: .properties.workloadProfileName,
+            configuration: .properties.configuration,
+            template: (.properties.template | del(.revisionSuffix) |
+              .containers |= map(del(.image)))
+          }' "$state/before.json" > "$state/protected-before.json"
+          container=$(jq -r '.properties.template.containers[0].name' "$state/before.json")
+          previous=$(jq -r '.properties.template.containers[0].image' "$state/before.json")
+          previous_revision=$(jq -r '.properties.latestRevisionName' "$state/before.json")
+          [[ -n "$container" && "$container" != null ]]
+          echo "container=$container" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "previous_revision=$previous_revision" >> "$GITHUB_OUTPUT"
+          endpoints=$(az afd endpoint list --resource-group "$GLOBAL_RESOURCE_GROUP" \
+            --profile-name "$FRONT_DOOR_PROFILE" --output json)
+          host=$(jq -er 'if length == 1 and .[0].enabledState == "Enabled"
+            then .[0].hostName else error("Expected exactly one enabled Front Door endpoint") end' <<< "$endpoints")
+          [[ "$host" =~ ^[a-zA-Z0-9.-]+\.azurefd\.net$ ]]
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Release preflight\nPrevious image: `%s`\n\nPrevious revision: `%s`\n' "$previous" "$previous_revision"
+            echo 'SQL settings are verified in the live app, not assumed from Bicep. The SQL MI path requires post-provisioning automation.'
+            echo 'Health checks prove process availability only; the current SQL provider is incompatible with managed-identity SQL authentication.'
+            echo 'Retain previous known-good retail digests in ACR. No retention/deletion policies are changed here.'
+            if [[ "$previous" != "$prefix"* ]]; then
+              echo '**First-release recovery:** no previous retail digest is available. Instructor-approved bootstrap recovery is required; this workflow will not roll back to a sample image.'
             fi
-          done
-      - name: Deploy image by digest
-        id: deploy
-        shell: bash
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Check freshness and update only the container image
+        id: update
         env:
-          ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
-          APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
-          APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
-          IMAGE_REFERENCE: ${{ needs.build-and-push.outputs.image }}
+          CONTAINER_NAME: ${{ steps.preflight.outputs.container }}
+          EXPECTED_IMAGE: ${{ inputs.expected_current_image }}
+          EXPECTED_REVISION: ${{ inputs.expected_current_revision }}
+          ROLLBACK_REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
-          revision_name=$(az containerapp update \
-            --name "$APP_NAME" \
-            --resource-group "$APP_RESOURCE_GROUP" \
-            --image "$IMAGE_REFERENCE" \
-            --revision-suffix "${GITHUB_SHA:0:12}" \
-            --query properties.latestRevisionName \
-            --output tsv)
-          test -n "$revision_name"
-          echo "revision=$revision_name" >> "$GITHUB_OUTPUT"
-      - name: Wait for revision health
-        shell: bash
-        env:
-          APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
-          APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
-          REVISION_NAME: ${{ steps.deploy.outputs.revision }}
-        run: |
-          set -euo pipefail
-          for attempt in {1..60}; do
-            health_state=$(az containerapp revision show \
-              --name "$APP_NAME" \
-              --resource-group "$APP_RESOURCE_GROUP" \
-              --revision "$REVISION_NAME" \
-              --query properties.healthState \
-              --output tsv)
-            if [[ "$health_state" == "Healthy" ]]; then
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+            if [[ "$head" != "$GITHUB_SHA" ]]; then
+              echo "::notice::Skipping stale deployment; main has advanced."
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              echo 'Deployment skipped because main advanced while this run waited.' >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            if [[ "$health_state" == "Unhealthy" ]]; then
-              echo "Revision $REVISION_NAME became unhealthy." >&2
+          else
+            [[ -n "$ROLLBACK_REASON" && -n "$EXPECTED_IMAGE" && -n "$EXPECTED_REVISION" ]]
+          fi
+          state="$RUNNER_TEMP/retail-release"
+          az containerapp show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+            --output json > "$state/current.json"
+          # Reject outside changes made since preflight, without printing settings.
+          jq -S '{identity, location, tags,
+            environmentId: .properties.environmentId,
+            workloadProfileName: .properties.workloadProfileName,
+            configuration: .properties.configuration, template: .properties.template,
+            revision: .properties.latestRevisionName}' "$state/before.json" > "$state/guard-before.json"
+          jq -S '{identity, location, tags,
+            environmentId: .properties.environmentId,
+            workloadProfileName: .properties.workloadProfileName,
+            configuration: .properties.configuration, template: .properties.template,
+            revision: .properties.latestRevisionName}' "$state/current.json" > "$state/guard-current.json"
+          cmp --silent "$state/guard-before.json" "$state/guard-current.json" || {
+            echo "::error::App changed after preflight; refusing to overwrite."; exit 1;
+          }
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            jq -e --arg image "$EXPECTED_IMAGE" --arg revision "$EXPECTED_REVISION" '
+              .properties.template.containers[0].image == $image and
+              .properties.latestRevisionName == $revision' "$state/current.json" >/dev/null || {
+                echo "::error::Rollback expected-current-state guard failed."; exit 1;
+              }
+          fi
+          revision=$(az containerapp update --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+            --container-name "$CONTAINER_NAME" --image "$IMAGE_REFERENCE" \
+            --revision-suffix "r${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --query properties.latestRevisionName --output tsv)
+          [[ -n "$revision" && "$revision" != null ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Wait for the exact revision and verify configuration preservation
+        if: steps.update.outputs.stale != 'true'
+        env:
+          REVISION: ${{ steps.update.outputs.revision }}
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/retail-release"
+          ready=false
+          for attempt in {1..60}; do
+            az containerapp revision show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+              --revision "$REVISION" --output json > "$state/revision.json"
+            health=$(jq -r '.properties.healthState' "$state/revision.json")
+            provisioning=$(jq -r '.properties.provisioningState' "$state/revision.json")
+            if [[ "$health" == Unhealthy || "$provisioning" == Failed || "$provisioning" == ProvisioningFailed ]]; then
+              echo "::error::Revision failed (health=$health, provisioning=$provisioning)."
               exit 1
+            fi
+            if jq -e --arg image "$IMAGE_REFERENCE" '
+              .properties.active == true and .properties.healthState == "Healthy" and
+              .properties.provisioningState == "Provisioned" and
+              (.properties.runningState == "Running" or .properties.runningState == "RunningAtMaxScale") and
+              .properties.template.containers[0].image == $image' "$state/revision.json" >/dev/null; then
+              ready=true
+              break
             fi
             sleep 10
           done
-          echo "Timed out waiting for revision $REVISION_NAME." >&2
-          exit 1
+          [[ "$ready" == true ]] || { echo "::error::Revision did not become healthy within ten minutes."; exit 1; }
+          az containerapp show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+            --output json > "$state/after.json"
+          jq -e --arg revision "$REVISION" --arg image "$IMAGE_REFERENCE" '
+            .properties.latestRevisionName == $revision and
+            .properties.latestReadyRevisionName == $revision and
+            .properties.template.containers[0].image == $image and
+            ([.properties.configuration.ingress.traffic[] |
+              select((.weight // 0) > 0)] |
+              length == 1 and .[0].weight == 100 and
+              (.[0].latestRevision == true or .[0].revisionName == $revision))
+            ' "$state/after.json" >/dev/null
+          jq -S '{
+            identity, location, tags,
+            environmentId: .properties.environmentId,
+            workloadProfileName: .properties.workloadProfileName,
+            configuration: .properties.configuration,
+            template: (.properties.template | del(.revisionSuffix) |
+              .containers |= map(del(.image)))
+          }' "$state/after.json" > "$state/protected-after.json"
+          cmp --silent "$state/protected-before.json" "$state/protected-after.json" || {
+            echo "::error::Protected configuration, including runtime settings or autoscaling, changed."
+            exit 1
+          }
       - name: Smoke test through Front Door
-        shell: bash
+        if: steps.update.outputs.stale != 'true'
         env:
-          GLOBAL_RESOURCE_GROUP: ${{ vars.LAB04_GLOBAL_RESOURCE_GROUP }}
-          PROFILE_NAME: ${{ format('{0}-{1}-afd', vars.LAB04_PREFIX, vars.LAB04_SUFFIX) }}
+          FRONT_DOOR_HOST: ${{ steps.preflight.outputs.host }}
         run: |
           set -euo pipefail
-          front_door_host=$(az afd endpoint list \
-            --resource-group "$GLOBAL_RESOURCE_GROUP" \
-            --profile-name "$PROFILE_NAME" \
-            --query '[0].hostName' \
-            --output tsv)
-          test -n "$front_door_host"
-          curl --fail --retry 12 --retry-all-errors --retry-delay 10 \
-            "https://${front_door_host}/health"
+          for attempt in {1..12}; do
+            status=$(curl --silent --show-error --proto '=https' \
+              --connect-timeout 5 --max-time 15 --header 'Cache-Control: no-cache' \
+              --output "$RUNNER_TEMP/retail-release/front-door-health" --write-out '%{http_code}' \
+              "https://${FRONT_DOOR_HOST}/health?release=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${attempt}") || status=000
+            if [[ "$status" == 200 && "$(cat "$RUNNER_TEMP/retail-release/front-door-health")" == Healthy ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Front Door /health did not return HTTP 200 Healthy."
+          exit 1
+      - name: Record successful release and recovery instructions
+        if: steps.update.outputs.stale != 'true'
+        env:
+          REVISION: ${{ steps.update.outputs.revision }}
+          PREVIOUS_IMAGE: ${{ steps.preflight.outputs.previous }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/retail-release-record"
+          jq -n --arg image "$IMAGE_REFERENCE" --arg revision "$REVISION" \
+            --arg previous "$PREVIOUS_IMAGE" --arg commit "$GITHUB_SHA" \
+            --arg app "$APP_NAME" --arg group "$APP_RESOURCE_GROUP" \
+            --arg run "$GITHUB_RUN_ID" --arg event "$GITHUB_EVENT_NAME" \
+            '{image: $image, revision: $revision, previousImage: $previous,
+              commit: $commit, app: $app, resourceGroup: $group, run: $run, event: $event}' \
+            > "$RUNNER_TEMP/retail-release-record/release.json"
+          {
+            printf '### Successful release\nCommit: `%s`\n\nImage: `%s`\n\nRevision: `%s`\n' "$GITHUB_SHA" "$IMAGE_REFERENCE" "$REVISION"
+            echo 'Front Door /health passed; database-backed retail flows remain unverified.'
+            echo 'Rollback: dispatch this workflow from main with a previous successful main release run ID, exact current image/revision, and reason. Approval in lab06-deploy is required.'
+            echo 'Rollback validates provenance and ACR availability, uses the same mutation lock, restores only the recorded digest as a new revision, and repeats health and configuration checks.'
+            echo 'Retain known-good images in ACR; release-record artifacts expire after 90 days.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: success() && steps.update.outputs.stale != 'true'
+        with:
+          name: retail-release-record
+          path: ${{ runner.temp }}/retail-release-record/release.json
+          retention-days: 90
+          if-no-files-found: error
+      - name: Report failure without exposing configuration
+        if: failure()
+        env:
+          PREVIOUS_IMAGE: ${{ steps.preflight.outputs.previous }}
+          REVISION: ${{ steps.update.outputs.revision }}
+        run: |
+          {
+            echo '### Release failed'
+            printf 'Candidate: `%s`\n\nRevision: `%s`\n\nPrevious image: `%s`\n' "$IMAGE_REFERENCE" "$REVISION" "$PREVIOUS_IMAGE"
+            echo 'No automatic rollback or infrastructure repair was attempted. Review sanitized step errors, then use the approved rollback procedure if a previous successful retail release exists.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove private configuration snapshots
+        if: always()
+        run: |
+          state="$RUNNER_TEMP/retail-release"
+          rm -f "$state/before.json" "$state/current.json" "$state/after.json" \
+            "$state/revision.json" "$state/protected-before.json" "$state/protected-after.json" \
+            "$state/guard-before.json" "$state/guard-current.json" "$state/front-door-health"
+
+  validate-rollback:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: lab06
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      image: ${{ steps.target.outputs.image }}
+    steps:
+      - name: Sign in with build environment OIDC for ACR verification
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify previous successful release and retained manifest
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_RUN: ${{ inputs.successful_run_id }}
+          ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
+          ACR_RESOURCE_GROUP: ${{ vars.LAB04_PRIMARY_RESOURCE_GROUP }}
+          APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
+          APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_RUN" != "$GITHUB_RUN_ID" ]]
+          source=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}")
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .conclusion == "success" and .event == "push" and .head_branch == "main" and
+            .head_repository.full_name == $repo and
+            .path == ".github/workflows/lab06-retail-cicd.yml"' <<< "$source" >/dev/null
+          gh run download "$SOURCE_RUN" --name retail-release-record \
+            --dir "$RUNNER_TEMP/rollback-record"
+          record="$RUNNER_TEMP/rollback-record/release.json"
+          jq -e --arg app "$APP_NAME" --arg group "$APP_RESOURCE_GROUP" \
+            --arg run "$SOURCE_RUN" --arg commit "$(jq -r .head_sha <<< "$source")" '
+            .app == $app and .resourceGroup == $group and .run == $run and
+            .commit == $commit and .event == "push"' "$record" >/dev/null
+          image=$(jq -er .image "$record")
+          server=$(az acr show --name "$ACR_NAME" --resource-group "$ACR_RESOURCE_GROUP" \
+            --query loginServer --output tsv)
+          [[ "$server" == "${ACR_NAME}.azurecr.io" ]]
+          prefix="${server}/${IMAGE_REPOSITORY}@"
+          [[ "$image" == "$prefix"* ]]
+          digest="${image#"$prefix"}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          retained=$(az acr repository show --name "$ACR_NAME" \
+            --image "${IMAGE_REPOSITORY}@${digest}" --query digest --output tsv)
+          [[ "$retained" == "$digest" ]]
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          printf 'Rollback target verified from successful main run `%s`: `%s`\n' \
+            "$SOURCE_RUN" "$image" >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate-rollback
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: lab06-deploy
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: retail-mutation-${{ github.repository }}-${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}-${{ vars.LAB06_CONTAINER_APP_NAME }}
+      cancel-in-progress: false
+    env:
+      IMAGE_REFERENCE: ${{ needs.validate-rollback.outputs.image }}
+      ACR_NAME: ${{ vars.LAB06_CONTAINER_REGISTRY_NAME }}
+      APP_NAME: ${{ vars.LAB06_CONTAINER_APP_NAME }}
+      APP_RESOURCE_GROUP: ${{ vars.LAB04_SECONDARY_RESOURCE_GROUP }}
+      RUNTIME_IDENTITY_RESOURCE_ID: ${{ vars.LAB06_RUNTIME_IDENTITY_RESOURCE_ID }}
+      RUNTIME_IDENTITY_CLIENT_ID: ${{ vars.LAB06_RUNTIME_IDENTITY_CLIENT_ID }}
+      GLOBAL_RESOURCE_GROUP: ${{ vars.LAB04_GLOBAL_RESOURCE_GROUP }}
+      FRONT_DOOR_PROFILE: ${{ format('{0}-{1}-afd', vars.LAB04_PREFIX, vars.LAB04_SUFFIX) }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps: *release-steps

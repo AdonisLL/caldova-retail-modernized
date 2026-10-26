@@ -393,23 +393,35 @@ jobs:
               .properties.provisioningState == "Provisioned" and
               (.properties.runningState == "Running" or .properties.runningState == "RunningAtMaxScale") and
               .properties.template.containers[0].image == $image' "$state/revision.json" >/dev/null; then
-              ready=true
-              break
+              az containerapp show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
+                --output json > "$state/after.json"
+              if jq -e --arg revision "$REVISION" --arg image "$IMAGE_REFERENCE" '
+                .properties.latestRevisionName == $revision and
+                .properties.latestReadyRevisionName == $revision and
+                .properties.template.containers[0].image == $image and
+                ([.properties.configuration.ingress.traffic[] |
+                  select((.weight // 0) > 0)] |
+                  length == 1 and .[0].weight == 100 and
+                  (.[0].latestRevision == true or .[0].revisionName == $revision))
+                ' "$state/after.json" >/dev/null; then
+                ready=true
+                break
+              fi
             fi
             sleep 10
           done
-          [[ "$ready" == true ]] || { echo "::error::Revision did not become healthy within ten minutes."; exit 1; }
-          az containerapp show --name "$APP_NAME" --resource-group "$APP_RESOURCE_GROUP" \
-            --output json > "$state/after.json"
-          jq -e --arg revision "$REVISION" --arg image "$IMAGE_REFERENCE" '
-            .properties.latestRevisionName == $revision and
-            .properties.latestReadyRevisionName == $revision and
-            .properties.template.containers[0].image == $image and
-            ([.properties.configuration.ingress.traffic[] |
-              select((.weight // 0) > 0)] |
-              length == 1 and .[0].weight == 100 and
-              (.[0].latestRevision == true or .[0].revisionName == $revision))
-            ' "$state/after.json" >/dev/null
+          if [[ "$ready" != true ]]; then
+            echo "::error::Timed out waiting for revision health, expected digest, latest-ready status and 100% traffic."
+            jq '{health: .properties.healthState, provisioning: .properties.provisioningState,
+              running: .properties.runningState, active: .properties.active,
+              image: .properties.template.containers[0].image}' "$state/revision.json"
+            if [[ -f "$state/after.json" ]]; then
+              jq '{latest: .properties.latestRevisionName, ready: .properties.latestReadyRevisionName,
+                image: .properties.template.containers[0].image,
+                traffic: .properties.configuration.ingress.traffic}' "$state/after.json"
+            fi
+            exit 1
+          fi
           jq -S '{
             identity, location, tags,
             environmentId: .properties.environmentId,

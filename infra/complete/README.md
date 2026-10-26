@@ -59,7 +59,9 @@ it because SQL MI is now selected exclusively through `databaseMode`.
   deployment identities. Preview receives Reader on the four lab resource
   groups. Only deployment receives the custom subscription deployment role,
   Contributor, RBAC Administrator, and Key Vault Secrets User.
-- The code-build identity receives only ACR push. The code-deployment identity
+- Lab 04 grants the code-build identity ACR push. The Lab 06 repository initializer
+  additionally ensures registry-scoped Reader access for metadata queries.
+  The code-deployment identity
   receives only Container App contributor and Front Door reader permissions at
   resource scope.
 - The retail runtime identity receives ACR pull before Container App creation

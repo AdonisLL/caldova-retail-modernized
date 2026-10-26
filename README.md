@@ -71,9 +71,33 @@ Each Azure integration turns on only when its setting is present; with none set,
 | `Logging__LogLevel__Default`, `Logging__LogLevel__Microsoft.AspNetCore` | Standard ASP.NET Core logging levels |
 | `AllowedHosts` | Standard ASP.NET Core host filtering |
 | `ASPNETCORE_ENVIRONMENT` | Hosting environment; the platform sets `Production` |
+| `ASPNETCORE_DETAILEDERRORS` | `true` explicitly enables diagnostic exception pages even in Production; turn off after troubleshooting because they can expose sensitive details |
 | `Lab06__DisableAntiforgery` | Deployment-only lab bypass for form-token validation; defaults to `false` in the app, explicitly `true` in the lab Docker image |
 
 Container Apps probes: `/health` (liveness) and `/ready` (readiness). No dependency checks are registered, so `/ready` currently reports process health, not SQL or Redis availability. See [infra/complete/](infra/complete/README.md) for the Azure infrastructure (Bicep).
+
+### Error diagnostics and Front Door probes
+
+The existing Front Door origin health probe sends `HEAD /`. The app explicitly
+returns `200 OK` with no body for that method/path without rendering a component
+or accessing SQL; normal `GET /` still renders the home page. A `405 Method Not
+Allowed` is a routing/method failure, not an exception, so detailed exception
+pages do not explain it. Health endpoints and `HEAD /` check process availability,
+not database readiness.
+
+`ASPNETCORE_DETAILEDERRORS=true` must be an actual environment variable on the
+running app. An `EnvironmentVariables` section in `appsettings.json` does not
+create environment variables or enable the host setting; the misleading section
+has been removed. The container image excludes appsettings files altogether.
+In Development, diagnostic exception pages are enabled by default. In other
+environments, the app uses the generic `/Error` page unless this host setting is
+explicitly true. Enabling it outside Development logs a warning.
+
+Detailed pages apply to unhandled exceptions (HTTP 500), not normal HTTP errors
+such as antiforgery validation failures or unsupported methods. Existing logs
+remain the preferred diagnostic source. Disable detailed pages afterwards:
+they can expose stack traces, source paths and request information publicly.
+The image does not enable them by default.
 
 ## Container image
 
@@ -146,8 +170,9 @@ The infrastructure and application are not yet a complete retail deployment:
   The infrastructure's imported `eshop_ai` database is distinct from the retail
   app's expected `eshop`; Lab 05 must migrate it and grant database access.
 - **Probes:** Container Apps startup/liveness/readiness probes and Front Door
-  probes target `/`, which renders the static home page, not a dedicated health
-  endpoint, and does not verify database availability. Configure process
+  probes target `/`. `GET /` renders the static home page; `HEAD /` has a dedicated
+  process-only handler matching Front Door's probe. Neither verifies database
+  availability. For future infrastructure changes, configure process
   probes to use `/health` and readiness to use `/ready`, after adding real
   dependency checks if SQL-backed readiness is required. The contract's
   `/health/live`, `/healthz`, and `/health/ready` routes do not exist in this app.

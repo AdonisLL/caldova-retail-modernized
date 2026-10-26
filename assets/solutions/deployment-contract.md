@@ -94,9 +94,19 @@ them but must not set, replace, or remove them.
 | `ConnectionStrings__StoreDbContext` | Yes | Passwordless SQL connection supplied after platform/database provisioning |
 | `ConnectionStrings__Redis` | No | Empty means per-replica in-memory cart storage |
 | `ConnectionStrings__AzureSignalR` | No | Empty means Blazor circuits remain on app replicas |
-| `DataProtection__BlobUri` | No | Empty means data-protection keys are local to each replica |
-| `DataProtection__KeyVaultKeyId` | No | Optionally wraps persisted data-protection keys |
+| `DataProtection__BlobUri` | No for deployment-only lab | Empty means data-protection keys are local to each replica; shared keys are needed for reliable authenticated multi-replica use |
+| `DataProtection__ApplicationName` | No for deployment-only lab | Stable discriminator when shared keys are provisioned |
+| `DataProtection__KeyVaultKeyUri` | No | Optionally wraps persisted data-protection keys with a Key Vault key |
+| `Lab06__DisableAntiforgery` | Lab image default: `true` | Explicit deployment-only exception: skips form-token validation, not authentication or authorization; not for production |
 | `ApplicationInsights__ConnectionString` or `APPLICATIONINSIGHTS_CONNECTION_STRING` | No | Empty disables the Azure Monitor exporter |
+
+For this deployment-only exercise, the application image explicitly enables the
+lab antiforgery bypass because shared key storage is not provisioned. This
+removes CSRF protection; it does not resolve replica-local authentication cookies
+or in-memory carts. Source runs default to validation enabled. No storage, new
+GitHub variables, initializer changes or deployment-setting changes are required.
+Before production use, set `Lab06__DisableAntiforgery=false` and provision shared
+Data Protection keys/session storage. See the [lab limitation](../../README.md#deployment-only-lab-limitation).
 
 The required SQL connection uses managed identity and has this shape:
 

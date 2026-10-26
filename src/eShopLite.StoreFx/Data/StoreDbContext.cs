@@ -1,8 +1,9 @@
 ﻿using System.Data.Entity;
 using System.Data.Entity.ModelConfiguration.Conventions;
 using System.Data.Entity.SqlServer;
-using System.Data.SqlClient;
 using System.Linq;
+
+using Microsoft.Data.SqlClient;
 
 using eShopLite.StoreFx.Models;
 
@@ -22,13 +23,10 @@ namespace eShopLite.StoreFx.Data
     }
 
     // Replaces the <entityFramework> section of the old Web.config, which .NET 10 never reads.
-    public class StoreDbConfiguration : DbConfiguration
+    public class StoreDbConfiguration : MicrosoftSqlDbConfiguration
     {
         public StoreDbConfiguration()
         {
-            SetProviderFactory(SqlProviderServices.ProviderInvariantName, SqlClientFactory.Instance);
-            SetProviderServices(SqlProviderServices.ProviderInvariantName, SqlProviderServices.Instance);
-
             // The SQL schema scripts are the source of truth; EF must never alter the database.
             SetDatabaseInitializer<StoreDbContext>(null);
         }

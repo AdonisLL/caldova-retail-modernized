@@ -4,12 +4,53 @@ A small Blazor storefront on .NET 10 (static server rendering), backed by Entity
 
 ## Setup
 
-Before running the app, open [appsettings.json](src/eShopLite.StoreFx/appsettings.json) and replace the placeholder password in the `StoreDbContext` connection string with your SQL Server password.
+Supply `ConnectionStrings__StoreDbContext` in your shell rather than saving
+credentials in [appsettings.json](src/eShopLite.StoreFx/appsettings.json).
+The app uses EF6's `Microsoft.EntityFramework.SqlServer` provider with
+`Microsoft.Data.SqlClient`, supporting SQL authentication and Microsoft Entra ID.
+See the [official EF6 provider guide](https://learn.microsoft.com/en-us/ef/ef6/what-is-new/microsoft-ef6-sqlserver).
 
 Then run it with the .NET 10 SDK:
 
 ```powershell
 dotnet run --project src/eShopLite.StoreFx
+```
+
+### Local development against Azure SQL Managed Instance
+
+Sign in with `az login`, then supply a developer connection using your instance's
+public endpoint on port 3342:
+
+```powershell
+az login
+$env:ASPNETCORE_ENVIRONMENT = 'Development'
+$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential'
+$env:ConnectionStrings__StoreDbContext = 'Server=tcp:<instance>.public.<dns-zone>.database.windows.net,3342;Initial Catalog=eshop;Authentication=Active Directory Default;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+dotnet run --project src\eShopLite.StoreFx --no-launch-profile --urls http://localhost:5187
+```
+
+Replace the endpoint with your SQL MI public FQDN. Your signed-in developer must
+have access to `eshop`, and the public endpoint/network rules must permit your
+client. `Active Directory Default` uses the developer credential chain, including
+Azure CLI. `AZURE_TOKEN_CREDENTIALS=AzureCliCredential` makes this local example
+use your CLI sign-in directly instead of probing unavailable managed identity
+endpoints. Do not set this CLI-only override in Container Apps, and do not put
+the Container App's managed identity client ID in this
+local connection or use `Active Directory Managed Identity` on your laptop.
+The app does not automatically rewrite authentication modes or endpoints.
+
+In Container Apps, keep the platform-supplied connection unchanged:
+`Authentication=Active Directory Managed Identity;User Id=<runtime-identity-client-id>`
+with the private SQL MI FQDN on port 1433. The `User Id` is the user-assigned
+runtime identity's **client ID**, not its principal ID. SQL authentication
+(`User ID`/`Password`) remains supported for non-Azure development; never commit
+the password. EF automatic database initialization remains disabled; this
+provider change does not migrate, seed, or alter the schema.
+
+Run provider regression tests without an Azure account or live SQL server:
+
+```powershell
+dotnet test eShopLiteFx.sln
 ```
 
 ## Azure configuration (optional)
@@ -70,15 +111,14 @@ The infrastructure and application are not yet a complete retail deployment:
   Registry pulls use the user-assigned runtime identity, not registry passwords;
   `AZURE_CLIENT_ID` selects that same identity for application Azure clients.
 - **SQL authentication:** [StoreDbContext](src/eShopLite.StoreFx/Data/StoreDbContext.cs)
-  uses EF6's `System.Data.SqlClient` provider. It does not support the platform's
-  `Authentication=Active Directory Managed Identity` connection string.
-  A compatible provider migration is needed; setting `AZURE_CLIENT_ID` alone
-  does not make the existing database provider use managed identity.
+  now uses EF6's modern Microsoft SQL provider and accepts the platform's
+  managed-identity connection string. Database permissions and private network
+  reachability are still provisioning prerequisites; setting `AZURE_CLIENT_ID`
+  alone does not grant SQL access.
 - **SQL provisioning:** the default SQL MI path omits the SQL environment
   variable in Bicep and relies on external importer automation to add it later.
-  The live Lab 04 app inspected for this change has only
-  `ASPNETCORE_ENVIRONMENT` and `AZURE_CLIENT_ID`, so its SQL configuration is
-  still missing. The imported `eshop_ai` database is distinct from the retail
+  Verify that the live app has the SQL environment variable before release.
+  The infrastructure's imported `eshop_ai` database is distinct from the retail
   app's expected `eshop`; Lab 05 must migrate it and grant database access.
 - **Probes:** Container Apps startup/liveness/readiness probes and Front Door
   probes target `/`, which renders the static home page, not a dedicated health

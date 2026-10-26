@@ -314,7 +314,7 @@ jobs:
           {
             printf '### Release preflight\nPrevious image: `%s`\n\nPrevious revision: `%s`\n' "$previous" "$previous_revision"
             echo 'SQL settings are verified in the live app, not assumed from Bicep. The SQL MI path requires post-provisioning automation.'
-            echo 'Health checks prove process availability only; the current SQL provider is incompatible with managed-identity SQL authentication.'
+            echo 'Health checks prove process availability only; verify SQL permissions and database-backed flows separately.'
             echo 'Retain previous known-good retail digests in ACR. No retention/deletion policies are changed here.'
             if [[ "$previous" != "$prefix"* ]]; then
               echo '**First-release recovery:** no previous retail digest is available. Instructor-approved bootstrap recovery is required; this workflow will not roll back to a sample image.'

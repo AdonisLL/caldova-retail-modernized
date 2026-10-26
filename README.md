@@ -47,7 +47,7 @@ runtime identity's **client ID**, not its principal ID. SQL authentication
 the password. EF automatic database initialization remains disabled; this
 provider change does not migrate, seed, or alter the schema.
 
-Run provider regression tests without an Azure account or live SQL server:
+Run regression tests without an Azure account or live SQL server:
 
 ```powershell
 dotnet test eShopLiteFx.sln
@@ -71,10 +71,35 @@ Each Azure integration turns on only when its setting is present; with none set,
 | `Logging__LogLevel__Default`, `Logging__LogLevel__Microsoft.AspNetCore` | Standard ASP.NET Core logging levels |
 | `AllowedHosts` | Standard ASP.NET Core host filtering |
 | `ASPNETCORE_ENVIRONMENT` | Hosting environment; the platform sets `Production` |
+| `Lab06__DisableAntiforgery` | Deployment-only lab bypass for form-token validation; defaults to `false` in the app, explicitly `true` in the lab Docker image |
 
 Container Apps probes: `/health` (liveness) and `/ready` (readiness). No dependency checks are registered, so `/ready` currently reports process health, not SQL or Redis availability. See [infra/complete/](infra/complete/README.md) for the Azure infrastructure (Bicep).
 
 ## Container image
+
+### Deployment-only lab limitation
+
+Lab 04 does not provision shared Data Protection storage. For this deployment-only
+exercise, the Dockerfile sets `Lab06__DisableAntiforgery=true`. This disables
+antiforgery validation for Razor component POSTs and logout without adding Azure
+resources, modifying replica settings, changing the initializer or changing the
+image-only deployment workflow. Authentication and authorization remain enabled.
+Startup logs explicitly warn when the bypass is active.
+
+**This mode removes CSRF protection and is not suitable for production or real
+customer data.** It only bypasses antiforgery failures; it does not make
+authentication cookies or in-memory carts reliable across replicas and restarts.
+Antiforgery validation remains enabled by default outside the lab image:
+omitting the setting or setting it to `false` requires valid antiforgery tokens.
+For a production deployment, disable the bypass and provision a shared Data
+Protection key ring and shared session storage.
+
+For local source runs only, enable the same lab bypass with
+`$env:Lab06__DisableAntiforgery = 'true'` before `dotnet run`.
+Remove it afterwards with `Remove-Item Env:Lab06__DisableAntiforgery`.
+When running a container, `--env Lab06__DisableAntiforgery=false` overrides the
+image's lab default. No repository variable or infrastructure update is needed
+for the deployment-only lab mode; rebuild and release the image.
 
 Build from the repository root (Linux containers):
 

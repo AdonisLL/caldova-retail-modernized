@@ -27,9 +27,11 @@ builder.Services.AddRazorComponents();
 builder.Services.AddCascadingAuthenticationState();
 
 var connectionString = builder.Configuration.GetConnectionString("StoreDbContext");
+var storeDbConnectionFactory = new StoreDbConnectionFactory(connectionString ?? string.Empty, builder.GetAzureCredential());
+builder.Services.AddSingleton(storeDbConnectionFactory);
 
 // One context per request, so every service in a request shares a single unit of work.
-builder.Services.AddScoped<IStoreDbContext>(_ => new StoreDbContext(connectionString));
+builder.Services.AddScoped<IStoreDbContext>(_ => new StoreDbContext(storeDbConnectionFactory.CreateConnection()));
 builder.Services.AddTransient<ISessionStore, HttpContextSessionStore>();
 builder.Services.AddTransient<IFlashMessages, SessionFlashMessages>();
 builder.Services.AddTransient<IStoreService, StoreService>();
@@ -58,7 +60,8 @@ builder.Services.AddAuthorization();
 builder.AddDataProtectionKeyStore();
 
 // Container Apps probes: /health = the process is up, /ready = checks tagged "ready" pass.
-builder.Services.AddHealthChecks();
+builder.Services.AddHealthChecks()
+    .AddCheck<StoreDatabaseHealthCheck>("store-database", tags: new[] { "ready" });
 
 var app = builder.Build();
 

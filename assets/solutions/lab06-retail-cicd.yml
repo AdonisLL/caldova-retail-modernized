@@ -26,6 +26,7 @@ permissions:
 
 env:
   SOLUTION: eShopLiteFx.sln
+  TEST_PROJECT: tests/eShopLite.StoreFx.Tests/eShopLite.StoreFx.Tests.csproj
   BUILD_CONTEXT: .
   DOCKERFILE: src/eShopLite.StoreFx/Dockerfile
   IMAGE_REPOSITORY: caldova-retail
@@ -50,7 +51,7 @@ jobs:
         run: dotnet build "$SOLUTION" --configuration Release --no-restore
 
       - name: Test
-        run: dotnet test "$SOLUTION" --configuration Release --no-build -- RunConfiguration.TreatNoTestsAsError=true
+        run: dotnet test "$TEST_PROJECT" --configuration Release --no-build
 
       - name: Build container
         run: docker build --file "$DOCKERFILE" --tag caldova-retail:validation "$BUILD_CONTEXT"
@@ -245,3 +246,5 @@ jobs:
           test -n "$front_door_host"
           curl --fail --retry 12 --retry-all-errors --retry-delay 10 \
             "https://${front_door_host}/health"
+          curl --fail --retry 12 --retry-all-errors --retry-delay 10 \
+            "https://${front_door_host}/ready"

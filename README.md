@@ -20,7 +20,7 @@ Each Azure integration turns on only when its setting is present; with none set,
 | --- | --- |
 | `AZURE_CLIENT_ID` | Use this user-assigned managed identity (otherwise the system-assigned one) |
 | `KeyVault__Uri` | Key Vault as a configuration source, e.g. a `ConnectionStrings--StoreDbContext` secret |
-| `DataProtection__BlobUri` | Keep the sign-in/session/antiforgery key ring in a blob so it survives restarts and is shared by replicas |
+| `DataProtection__BlobUri` | Keep the sign-in/session key ring in a blob so it survives restarts and is shared by replicas |
 | `DataProtection__KeyVaultKeyUri` | Also encrypt that key ring with a Key Vault key (needs `DataProtection__BlobUri`) |
 | `DataProtection__ApplicationName` | Fixed app name so all replicas and revisions share keys |
 | `Redis__Endpoint` | Keep session (the cart) in Azure Redis, e.g. `myredis.redis.cache.windows.net:6380` |
@@ -28,6 +28,12 @@ Each Azure integration turns on only when its setting is present; with none set,
 | `ASPNETCORE_FORWARDEDHEADERS_ENABLED` | `true` behind Container Apps ingress, so the app sees the original `https` scheme |
 
 Container Apps probes: `/health` (liveness) and `/ready` (readiness). See [infra/](infra/README.md) for the Azure infrastructure (Bicep).
+
+## Form security
+
+Antiforgery validation is disabled application-wide, including login, logout, cart updates, and checkout. POST requests do not require an antiforgery token. Authentication, authorization, and form input validation remain enabled.
+
+This removes CSRF protection from state-changing requests and is intended for the lab only, not production. Shared Data Protection keys are still required for authentication and session cookies across replicas and restarts.
 
 # 🔑 Demo logins
 

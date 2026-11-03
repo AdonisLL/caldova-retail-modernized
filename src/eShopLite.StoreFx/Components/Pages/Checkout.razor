@@ -52,7 +52,6 @@
                     <h2 class="h5">Order total</h2>
                     <p class="summary-amount">USD @_cart.Total.ToString("N2")</p>
                     <form method="post" @formname="place-order" @onsubmit="PlaceOrder" class="d-grid gap-2">
-                        <AntiforgeryToken />
                         <button type="submit" class="btn btn-success btn-lg">Place order</button>
                         <a href="Cart" class="btn btn-outline-secondary">Back to cart</a>
                     </form>

@@ -46,7 +46,6 @@ else
                             </div>
                             <div class="cart-line-total text-end fw-semibold">USD @item.LineTotal.ToString("N2")</div>
                             <form method="post" @formname="@($"remove-{item.ProductId}")" @onsubmit="() => Remove(item.ProductId)" data-enhance class="cart-line-remove">
-                                <AntiforgeryToken />
                                 <button type="submit" class="btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1" aria-label="@($"Remove {item.Name}")">
                                     <Icon Name="trash" Size="16" /> <span class="d-none d-md-inline">Remove</span>
                                 </button>

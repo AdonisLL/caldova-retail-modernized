@@ -1,6 +1,5 @@
 using System;
 
-using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Builder;
@@ -27,9 +26,11 @@ builder.Services.AddRazorComponents();
 builder.Services.AddCascadingAuthenticationState();
 
 var connectionString = builder.Configuration.GetConnectionString("StoreDbContext");
+var storeDbConnectionFactory = new StoreDbConnectionFactory(connectionString ?? string.Empty, builder.GetAzureCredential());
+builder.Services.AddSingleton(storeDbConnectionFactory);
 
 // One context per request, so every service in a request shares a single unit of work.
-builder.Services.AddScoped<IStoreDbContext>(_ => new StoreDbContext(connectionString));
+builder.Services.AddScoped<IStoreDbContext>(_ => new StoreDbContext(storeDbConnectionFactory.CreateConnection()));
 builder.Services.AddTransient<ISessionStore, HttpContextSessionStore>();
 builder.Services.AddTransient<IFlashMessages, SessionFlashMessages>();
 builder.Services.AddTransient<IStoreService, StoreService>();
@@ -58,7 +59,8 @@ builder.Services.AddAuthorization();
 builder.AddDataProtectionKeyStore();
 
 // Container Apps probes: /health = the process is up, /ready = checks tagged "ready" pass.
-builder.Services.AddHealthChecks();
+builder.Services.AddHealthChecks()
+    .AddCheck<StoreDatabaseHealthCheck>("store-database", tags: new[] { "ready" });
 
 var app = builder.Build();
 
@@ -74,23 +76,16 @@ app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages:
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseSession();
-app.UseAntiforgery();
 
 app.MapStaticAssets();
-app.MapRazorComponents<App>();
+app.MapRazorComponents<App>().DisableAntiforgery();
 
 app.MapHealthChecks("/health", new HealthCheckOptions { Predicate = _ => false });
 app.MapHealthChecks("/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") });
 
-// Signing out has no page of its own; the header's "Log out" button posts here. The endpoint binds
-// no form fields, so the antiforgery token has to be checked explicitly.
-app.MapPost("/Account/Logout", async (HttpContext context, IAntiforgery antiforgery) =>
+// Signing out has no page of its own; the header's "Log out" button posts here.
+app.MapPost("/Account/Logout", async (HttpContext context) =>
     {
-        if (!await antiforgery.IsRequestValidAsync(context))
-        {
-            return Results.BadRequest();
-        }
-
         await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
         context.Session.Clear();
 
@@ -99,3 +94,5 @@ app.MapPost("/Account/Logout", async (HttpContext context, IAntiforgery antiforg
     .RequireAuthorization();
 
 app.Run();
+
+public partial class Program { }

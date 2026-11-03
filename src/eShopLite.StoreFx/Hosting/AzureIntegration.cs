@@ -71,8 +71,8 @@ namespace eShopLite.StoreFx.Hosting
         }
 
         /// <summary>
-        /// Where the Data Protection key ring lives. Those keys sign the auth cookie, the session cookie
-        /// and antiforgery tokens, so in containers they must outlive a restart and be shared by replicas.
+        /// Where the Data Protection key ring lives. Those keys protect the auth and session cookies,
+        /// so in containers they must outlive a restart and be shared by replicas.
         /// DataProtection:BlobUri persists them to a blob; DataProtection:KeyVaultKeyUri additionally wraps
         /// them with a Key Vault key; DataProtection:ApplicationName pins the app discriminator. With none
         /// set, ASP.NET Core's default (local) key ring is used, exactly as before.

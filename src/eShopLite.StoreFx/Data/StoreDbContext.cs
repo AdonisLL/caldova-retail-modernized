@@ -1,4 +1,5 @@
-﻿using System.Data.Entity;
+﻿using System.Data.Common;
+using System.Data.Entity;
 using System.Data.Entity.ModelConfiguration.Conventions;
 using System.Data.Entity.SqlServer;
 using System.Data.SqlClient;
@@ -42,6 +43,10 @@ namespace eShopLite.StoreFx.Data
         }
 
         public StoreDbContext(string nameOrConnectionString) : base(nameOrConnectionString)
+        {
+        }
+
+        public StoreDbContext(DbConnection connection) : base(connection, contextOwnsConnection: true)
         {
         }
 

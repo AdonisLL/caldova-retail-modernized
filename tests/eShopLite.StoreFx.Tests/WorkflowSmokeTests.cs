@@ -1,4 +1,6 @@
-﻿namespace eShopLite.StoreFx.Tests;
+﻿using Xunit;
+
+namespace eShopLite.StoreFx.Tests;
 
 public class WorkflowSmokeTests
 {
